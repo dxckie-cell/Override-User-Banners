@@ -13,6 +13,18 @@ const BANNER_KEY = /banner/i;
 
 let patches: (() => void)[] = [];
 
+// users we put a placeholder banner on, with what it was before
+const injectedUsers = new Map<any, any>();
+
+// log a message the first time a given tag shows up, so the debug list
+// shows what happens at runtime without being flooded
+const traced = new Set<string>();
+function traceOnce(tag: string, message: string): void {
+    if (traced.has(tag)) return;
+    traced.add(tag);
+    debug(message);
+}
+
 export { default as settings } from "./settings";
 
 export interface BannerOverride {
@@ -59,7 +71,7 @@ function withBanner(profile: any, userId?: string) {
 }
 
 function applyPatches(): void {
-    debug("loaded v1.1.1");
+    debug("loaded v1.2.0");
 
     initStorage();
 
@@ -67,6 +79,18 @@ function applyPatches(): void {
     if (!UserStore) {
         debug("userStore not found");
         return;
+    }
+
+    // what the stored users look like before anything is patched
+    for (const entry of (storage.overrides ?? []) as BannerOverride[]) {
+        try {
+            const id = entry?.id?.trim();
+            if (!id) continue;
+            const u = UserStore.getUser(id);
+            debug(`override user ${id}: ${u ? `in cache, banner=${String(u.banner)}, getBannerURL=${typeof u.getBannerURL}` : "not in cache"}`);
+        } catch (e) {
+            debug(`could not inspect ${entry?.id}: ${(e as Error)?.message}`);
+        }
     }
 
     let patched = 0;
@@ -99,7 +123,8 @@ function applyPatches(): void {
             // only getters that return a URL or an image source; hooks and
             // components are left alone
             if (!/^get.*(url|source|uri|image)$/i.test(key)) {
-                debug(`export (not patched): ${key}`);
+                // only list the ones that could plausibly be about profiles
+                if (/user|profile|member/i.test(key)) debug(`export (not patched): ${key}`);
                 continue;
             }
 
@@ -111,6 +136,7 @@ function applyPatches(): void {
                 const result = original.apply(self, args);
                 // only intercept users that have an override, ignore everyone else
                 if (!overrideUrl) return result;
+                traceOnce(`get:${key}`, `${key} was called for an overridden user`);
                 if (wantsSource) {
                     return { ...(result && typeof result === "object" ? result : {}), uri: overrideUrl };
                 }
@@ -126,9 +152,13 @@ function applyPatches(): void {
     // patch the profile store, so users without a banner still get one rendered
     const UserProfileStore = findByStoreName("UserProfileStore");
     if (UserProfileStore) {
-        const ok = wrap(UserProfileStore, "getUserProfile", (original, self, args) =>
-            withBanner(original.apply(self, args), args[0])
-        );
+        const ok = wrap(UserProfileStore, "getUserProfile", (original, self, args) => {
+            const profile = original.apply(self, args);
+            if (getOverrideUrl(args[0])) {
+                traceOnce("profile", `getUserProfile for an overridden user: ${profile ? `found, banner=${String(profile.banner)}` : "null"}`);
+            }
+            return withBanner(profile, args[0]);
+        });
         if (ok) {
             patched++;
             debug("patched UserProfileStore.getUserProfile");
@@ -144,6 +174,26 @@ function applyPatches(): void {
         }
     } else {
         debug("userProfileStore not found");
+    }
+
+    // the profile screen may read the banner straight off the user object, so
+    // give overridden users a placeholder banner there too (restored on unload)
+    const okUser = wrap(UserStore, "getUser", (original, self, args) => {
+        const user = original.apply(self, args);
+        if (user && !user.banner && getOverrideUrl(args[0])) {
+            try {
+                injectedUsers.set(user, user.banner);
+                user.banner = PLACEHOLDER_HASH;
+                traceOnce("user", "gave an overridden user a placeholder banner");
+            } catch (e) {
+                traceOnce("user-fail", `could not set banner on user: ${(e as Error)?.message}`);
+            }
+        }
+        return user;
+    });
+    if (okUser) {
+        patched++;
+        debug("patched UserStore.getUser");
     }
 
     debug(patched === 0 ? "nothing could be patched" : `${patched} patches applied`);
@@ -182,6 +232,12 @@ export function onUnload(): void {
     // restore patches
     patches.forEach(unpatch => unpatch());
     patches = [];
+
+    injectedUsers.forEach((original, user) => {
+        try { user.banner = original; } catch { /* nothing to restore */ }
+    });
+    injectedUsers.clear();
+    traced.clear();
 
     debug("unloaded");
 }
