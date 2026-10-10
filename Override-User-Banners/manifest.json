@@ -1,1 +1,1 @@
-{"name":"Override User Banners","description":"Allows you to set a custom profile banner for any Discord user.","authors":[{"name":"dxckie-cell"}],"version":"1.0.0","main":"index.js","hash":"c861e71e7d671fb29345b533e1527053d0b01d19dc63104231b364db7bb98357"}
+{"name":"Override User Banners","description":"Allows you to set a custom profile banner for any Discord user.","authors":[{"name":"dxckie-cell"}],"version":"1.1.0","main":"index.js","hash":"3b2028b405652503db30cc07b7fb21c14dcad0607fc434b6e9e7dd2ed1c4efdd"}
