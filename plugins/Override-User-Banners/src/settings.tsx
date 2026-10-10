@@ -3,7 +3,7 @@ import { Forms } from "@vendetta/ui/components";
 import { storage } from "@vendetta/plugin";
 import { useProxy } from "@vendetta/storage";
 
-import { debugLines } from "./debug";
+import { statusLines } from "./status";
 
 const { FormDivider, FormInput, FormRow } = Forms;
 
@@ -47,19 +47,13 @@ export default () => {
                 onPress={addOverride}
             />
             <FormDivider />
-            <FormRow label="Debug info (what happened when the plugin loaded)" />
+            <FormRow label="Status" />
             <ReactNative.View style={{ paddingHorizontal: 16, paddingBottom: 32 }}>
-                {debugLines.length === 0 ? (
-                    <ReactNative.Text selectable style={{ color: "#999999" }}>
-                        Nothing recorded yet. Turn the plugin off and on to reload it.
+                {statusLines.map((line, i) => (
+                    <ReactNative.Text key={i} selectable style={{ color: "#999999", fontSize: 12 }}>
+                        {line}
                     </ReactNative.Text>
-                ) : (
-                    debugLines.map((line, i) => (
-                        <ReactNative.Text key={i} selectable style={{ color: "#999999", fontSize: 12 }}>
-                            {line}
-                        </ReactNative.Text>
-                    ))
-                )}
+                ))}
             </ReactNative.View>
         </ReactNative.ScrollView>
     );

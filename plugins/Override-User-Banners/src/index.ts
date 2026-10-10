@@ -1,36 +1,22 @@
-import { findAll, findByStoreName } from "@vendetta/metro";
+import { findByProps, findByStoreName } from "@vendetta/metro";
 import { FluxDispatcher } from "@vendetta/metro/common";
 import { storage } from "@vendetta/plugin";
-import { showToast } from "@vendetta/ui/toasts";
 
-import { debug, debugSlot, resetDebug, shape } from "./debug";
+import { resetStatus, status } from "./status";
 
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 
 // placeholder banner hash, only used so the profile UI renders a banner area
-// for users who have no banner of their own; the URL getter swaps it out
+// for users who have no banner of their own; the real image comes from the override
 const PLACEHOLDER_HASH = "override-user-banner";
-
-const BANNER_KEY = /banner/i;
 
 let patches: (() => void)[] = [];
 
 // users and profiles we put a placeholder banner on, with what it was before
 const injected = new Map<any, any>();
 
-// how often each patched function ran, for the debug list
-const counters = new Map<string, number>();
-function bump(tag: string): number {
-    const n = (counters.get(tag) ?? 0) + 1;
-    counters.set(tag, n);
-    return n;
-}
-
-// which things have already had their shape logged
-const shapesLogged = new Set<string>();
-
-// display profiles (the object the profile screen reads) already handled
-const seenProfiles = new WeakSet<object>();
+// display profiles (what the profile screen reads) that are already handled
+const handledProfiles = new WeakSet<object>();
 
 export { default as settings } from "./settings";
 
@@ -57,7 +43,7 @@ function getOverrideUrl(userId?: string): string | undefined {
     return undefined;
 }
 
-// wraps obj[key] so that `wrapper(original, ...args)` runs instead, and
+// wraps obj[key] so that `wrapper(original, self, args)` runs instead, and
 // registers a function that puts the original back on unload
 function wrap(obj: any, key: string, wrapper: (original: Function, self: any, args: any[]) => any): boolean {
     try {
@@ -69,295 +55,127 @@ function wrap(obj: any, key: string, wrapper: (original: Function, self: any, ar
         };
         patches.push(() => { obj[key] = original; });
         return true;
-    } catch (e) {
-        debug(`could not patch ${key}: ${(e as Error)?.message}`);
-        return false;
-    }
-}
-
-// gives a profile of an overridden user a banner so the UI shows the banner
-// area. the object is changed in place (and restored on unload) so that any
-// methods on it keep working; a copy is only used if it can't be changed
-function withBanner(profile: any, userId?: string) {
-    if (!profile || !getOverrideUrl(userId)) return profile;
-    if (profile.banner) return profile;
-    try {
-        injected.set(profile, profile.banner);
-        profile.banner = PLACEHOLDER_HASH;
-        return profile;
-    } catch {
-        return { ...profile, banner: PLACEHOLDER_HASH };
-    }
-}
-
-function profileWrapper(name: string) {
-    return (original: Function, self: any, args: any[]) => {
-        const profile = original.apply(self, args);
-        if (getOverrideUrl(args[0])) {
-            const kind = profile ? "found" : "null";
-            const n = bump(`${name}:${kind}`);
-            debugSlot(
-                `${name}:${kind}`,
-                `${name} for an overridden user: ${kind} x${n}` +
-                (profile ? `, banner=${String(profile.banner)}, type=${profile.constructor?.name}` : "")
-            );
-        }
-        return withBanner(profile, args[0]);
-    };
-}
-
-// --- display profile -------------------------------------------------------
-// the profile screen passes a "displayProfile" object around instead of
-// calling the URL getters, so its banner fields are changed directly
-
-// every banner-looking property name on an object and its prototype chain
-function bannerNames(obj: any): string[] {
-    const names = new Set<string>();
-    let current = obj;
-    for (let depth = 0; current && current !== Object.prototype && depth < 6; depth++) {
-        try {
-            for (const name of Object.getOwnPropertyNames(current)) {
-                if (BANNER_KEY.test(name)) names.add(name);
-            }
-        } catch {
-            // skip objects that can't be inspected
-        }
-        current = Object.getPrototypeOf(current);
-    }
-    return Array.from(names);
-}
-
-function setOwn(obj: any, name: string, value: any): boolean {
-    try {
-        Object.defineProperty(obj, name, { value, configurable: true, writable: true, enumerable: true });
-        return true;
     } catch {
         return false;
     }
 }
 
-// what to put in place of the banner property `name`, or undefined to leave it
-function replacementFor(name: string, isFn: boolean, current: any, url: string): { value: any } | undefined {
-    if (name.toLowerCase() === "banner") {
-        return current ? undefined : { value: PLACEHOLDER_HASH };
+// gives a user or profile of an overridden user a banner so the profile screen
+// draws the banner area. changed in place (and restored on unload) so any
+// methods on the object keep working
+function addPlaceholderBanner(target: any, userId?: string): void {
+    if (!target || target.banner || !getOverrideUrl(userId)) return;
+    try {
+        injected.set(target, target.banner);
+        target.banner = PLACEHOLDER_HASH;
+    } catch {
+        // frozen objects are left alone
     }
-    if (/source$/i.test(name)) {
-        return { value: isFn ? () => ({ uri: url }) : { uri: url } };
-    }
-    if (/(url|uri)$/i.test(name)) {
-        return { value: isFn ? () => url : url };
-    }
-    if (/^has.*banner/i.test(name)) {
-        return { value: isFn ? () => true : true };
-    }
-    return undefined;
 }
 
-function handleDisplayProfile(dp: any, userId?: string): void {
-    if (!dp || typeof dp !== "object" || seenProfiles.has(dp)) return;
-    seenProfiles.add(dp);
+// the profile screen builds its banner from a "displayProfile" object, so
+// that object's getBannerURL is pointed at the override
+function patchDisplayProfile(profile: any, userId?: string): void {
+    if (!profile || typeof profile !== "object" || handledProfiles.has(profile)) return;
 
-    const names = bannerNames(dp);
-    const url = getOverrideUrl(userId ?? dp.userId ?? dp.id);
+    const id = userId ?? profile.userId;
+    if (!getOverrideUrl(id)) return;
+    handledProfiles.add(profile);
 
-    const slot = url ? "dp-mine" : "dp-other";
-    if (!shapesLogged.has(slot)) {
-        shapesLogged.add(slot);
-        let keys = "?";
-        try { keys = Object.keys(dp).slice(0, 24).join(","); } catch { /* ignore */ }
-        debug(
-            `${url ? "overridden" : "another"} user's displayProfile: type=${dp.constructor?.name}, ` +
-            `banner=${String(dp.banner)}, banner names=[${names.join(",")}], keys=[${keys}]`
-        );
-    }
-
-    if (!url) return;
-
-    const changed: string[] = [];
-    for (const name of names) {
-        let isFn = false;
-        let current: any;
-        try {
-            current = dp[name];
-            isFn = typeof current === "function";
-        } catch {
-            continue;
+    const original = profile.getBannerURL;
+    try {
+        if (!profile.banner) {
+            Object.defineProperty(profile, "banner", { value: PLACEHOLDER_HASH, configurable: true, writable: true, enumerable: true });
         }
-        const replacement = replacementFor(name, isFn, isFn ? undefined : current, url);
-        if (replacement && setOwn(dp, name, replacement.value)) changed.push(name);
+        Object.defineProperty(profile, "getBannerURL", {
+            value: function (...args: any[]) {
+                // looked up again on every call so edits and removals apply at once
+                return getOverrideUrl(id) ?? (typeof original === "function" ? original.apply(profile, args) : undefined);
+            },
+            configurable: true,
+            writable: true,
+            enumerable: true,
+        });
+    } catch {
+        // frozen objects are left alone
     }
-
-    const n = bump("dp-changed");
-    debugSlot("dp-changed", `changed ${n} displayProfiles of overridden users, last: [${changed.join(",")}]`);
 }
 
-// --- per-export patches ----------------------------------------------------
-// these are separate functions on purpose: closures made inside a loop shared
-// their variables in the built bundle, so every value is passed in instead
-
-function getterWrapper(key: string, isProfileRelated: boolean) {
-    const slot = `get:${key}`;
-    const wantsSource = /source$/i.test(key);
-
-    return (original: Function, self: any, args: any[]) => {
-        const first = args[0];
-        const id = typeof first === "string" ? first : first?.id;
-        const overrideUrl = getOverrideUrl(id);
-        const result = original.apply(self, args);
-
-        const all = bump(`${slot}:all`);
-        const mine = overrideUrl ? bump(`${slot}:mine`) : (counters.get(`${slot}:mine`) ?? 0);
-        if (isProfileRelated && !shapesLogged.has(slot)) {
-            shapesLogged.add(slot);
-            debug(`${key} first arg: ${shape(first)}`);
+// the hook the profile screen calls with { user, displayProfile, ... }
+function bannerHookWrapper(original: Function, self: any, args: any[]) {
+    for (const arg of args) {
+        if (arg && typeof arg === "object" && arg.displayProfile) {
+            patchDisplayProfile(arg.displayProfile, arg.user?.id);
         }
-        debugSlot(slot, `patched ${key}: ${all} calls, ${mine} for overridden users`);
-
-        // only intercept users that have an override, ignore everyone else
-        if (!overrideUrl) return result;
-        if (wantsSource) {
-            return { ...(result && typeof result === "object" ? result : {}), uri: overrideUrl };
-        }
-        return overrideUrl;
-    };
+    }
+    return original.apply(self, args);
 }
 
-function hookTracer(key: string) {
-    const slot = `hook:${key}`;
-
-    return (original: Function, self: any, args: any[]) => {
-        const n = bump(slot);
-        if (!shapesLogged.has(slot)) {
-            shapesLogged.add(slot);
-            debug(`${key} first args: ${args.map(shape).join(" | ")}`);
-        }
-        debugSlot(slot, `${key} (traced): ${n} calls`);
-
-        for (const arg of args) {
-            if (arg && typeof arg === "object" && arg.displayProfile) {
-                handleDisplayProfile(arg.displayProfile, arg.user?.id);
-            }
-        }
-        return original.apply(self, args);
-    };
+// getUserBannerURL and friends, for any screen that builds a banner URL itself
+function urlGetterWrapper(original: Function, self: any, args: any[]) {
+    const first = args[0];
+    const id = typeof first === "string" ? first : first?.id;
+    return getOverrideUrl(id) ?? original.apply(self, args);
 }
 
-// patches or traces one export of a module, returns true if it was changed
-function patchExport(mod: any, key: string): boolean {
-    if (!BANNER_KEY.test(key) || typeof mod[key] !== "function") return false;
+function patchUrlGetter(name: string): boolean {
+    const mod = findByProps(name);
+    return !!mod && wrap(mod, name, urlGetterWrapper);
+}
 
-    const isGetter = /^get.*(url|source|uri|image)$/i.test(key);
-    const isProfileRelated = /profile|member|^useUser/i.test(key);
-
-    if (isGetter) {
-        debugSlot(`get:${key}`, `patched ${key}: 0 calls, 0 for overridden users`);
-        return wrap(mod, key, getterWrapper(key, isProfileRelated));
-    }
-
-    // hooks about profiles are only traced, never changed
-    if (/^use/.test(key) && isProfileRelated) {
-        debugSlot(`hook:${key}`, `${key} (traced): 0 calls`);
-        wrap(mod, key, hookTracer(key));
-    } else if (isProfileRelated) {
-        debug(`export (not patched): ${key}`);
-    }
-    return false;
+// profile lookups: hands back the profile with a placeholder banner on it
+function profileWrapper(original: Function, self: any, args: any[]) {
+    const profile = original.apply(self, args);
+    addPlaceholderBanner(profile, args[0]);
+    return profile;
 }
 
 function applyPatches(): void {
-    resetDebug();
-    debug(`loaded v${VERSION}`);
+    resetStatus();
+    status(`loaded v${VERSION}`);
 
     initStorage();
 
     const UserStore = findByStoreName("UserStore");
     if (!UserStore) {
-        debug("userStore not found");
+        status("user store not found, nothing patched");
         return;
     }
 
-    // what the stored users look like before anything is patched
+    // a placeholder left behind by an earlier load that was not unloaded
     for (const entry of (storage.overrides ?? []) as BannerOverride[]) {
         try {
-            const id = entry?.id?.trim();
-            if (!id) continue;
-            const u = UserStore.getUser(id);
-            // a placeholder left behind by an earlier load that was not unloaded
-            if (u && u.banner === PLACEHOLDER_HASH) {
-                try { u.banner = null; } catch { /* leave it */ }
-            }
-            debug(`override user ${id}: ${u ? `in cache, banner=${String(u.banner)}` : "not in cache"}`);
-        } catch (e) {
-            debug(`could not inspect ${entry?.id}: ${(e as Error)?.message}`);
+            const user = entry?.id ? UserStore.getUser(entry.id.trim()) : null;
+            if (user && user.banner === PLACEHOLDER_HASH) user.banner = null;
+        } catch {
+            // nothing to clean up
         }
     }
 
-    let patched = 0;
+    // the profile screen's banner
+    const hookModule = findByProps("useUserProfileBannerBackgroundColor");
+    const hookOk = !!hookModule && wrap(hookModule, "useUserProfileBannerBackgroundColor", bannerHookWrapper);
+    status(hookOk ? "profile screen banner: patched" : "profile screen banner: NOT FOUND, banners will not show there");
 
-    // patch every banner getter we can find, since the name differs between builds
-    let modules: any[] = [];
-    try {
-        modules = findAll((m: any) => {
-            try {
-                return !!m && Object.keys(m).some(k => BANNER_KEY.test(k) && typeof m[k] === "function");
-            } catch {
-                return false;
-            }
-        }) as any[];
-    } catch (e) {
-        debug(`module scan failed: ${(e as Error)?.message}`);
-    }
-    debug(`found ${modules.length} modules with banner exports`);
+    // anything else that builds a banner URL
+    const getters = ["getUserBannerURL", "getGuildMemberBannerURL"].filter(patchUrlGetter);
+    status(`banner URL functions patched: ${getters.length ? getters.join(", ") : "none"}`);
 
-    const done = new Set<any>();
-    for (const mod of modules) {
-        if (done.has(mod)) continue;
-        done.add(mod);
-
-        for (const key of Object.keys(mod)) {
-            if (patchExport(mod, key)) patched++;
-        }
-    }
-
-    // patch the profile stores, so users without a banner still get one rendered
+    // profile stores, so users without a banner still get one drawn
     const UserProfileStore = findByStoreName("UserProfileStore");
-    if (UserProfileStore) {
-        if (wrap(UserProfileStore, "getUserProfile", profileWrapper("getUserProfile"))) {
-            patched++;
-            debug("patched UserProfileStore.getUserProfile");
-        }
+    const profilesOk = !!UserProfileStore && [
+        wrap(UserProfileStore, "getUserProfile", profileWrapper),
+        wrap(UserProfileStore, "getGuildMemberProfile", profileWrapper),
+    ].some(Boolean);
+    status(profilesOk ? "profile store: patched" : "profile store: NOT FOUND");
 
-        // per-server profile, args are (userId, guildId)
-        if (wrap(UserProfileStore, "getGuildMemberProfile", profileWrapper("getGuildMemberProfile"))) {
-            patched++;
-            debug("patched UserProfileStore.getGuildMemberProfile");
-        }
-    } else {
-        debug("userProfileStore not found");
-    }
-
-    // the profile screen may read the banner straight off the user object, so
-    // give overridden users a placeholder banner there too (restored on unload)
-    const okUser = wrap(UserStore, "getUser", (original, self, args) => {
+    // same for the user object itself
+    const userOk = wrap(UserStore, "getUser", (original, self, args) => {
         const user = original.apply(self, args);
-        if (user && !user.banner && getOverrideUrl(args[0])) {
-            try {
-                injected.set(user, user.banner);
-                user.banner = PLACEHOLDER_HASH;
-                const n = bump("user-inject");
-                debugSlot("user-inject", `gave an overridden user a placeholder banner x${n}`);
-            } catch (e) {
-                debugSlot("user-inject", `could not set banner on user: ${(e as Error)?.message}`);
-            }
-        }
+        addPlaceholderBanner(user, args[0]);
         return user;
     });
-    if (okUser) {
-        patched++;
-        debug("patched UserStore.getUser");
-    }
-
-    debug(patched === 0 ? "nothing could be patched" : `${patched} patches applied`);
+    status(userOk ? "user store: patched" : "user store: NOT FOUND");
 
     // refresh ui for every overridden user
     for (const entry of (storage.overrides ?? []) as BannerOverride[]) {
@@ -366,15 +184,9 @@ function applyPatches(): void {
             if (user) {
                 FluxDispatcher.dispatch({ type: "USER_UPDATE", user });
             }
-        } catch (e) {
-            debug(`could not trigger refresh for ${entry?.id}: ${(e as Error)?.message}`);
+        } catch {
+            // the next time the profile opens will show it anyway
         }
-    }
-
-    try {
-        showToast(`Override User Banners: ${patched} patches`);
-    } catch {
-        // toast is only a convenience
     }
 }
 
@@ -383,7 +195,7 @@ export function onLoad(): void {
     try {
         applyPatches();
     } catch (e) {
-        debug(`onLoad crashed: ${(e as Error)?.message}`);
+        status(`crashed on load: ${(e as Error)?.message}`);
     }
 }
 
@@ -392,12 +204,8 @@ export function onUnload(): void {
     patches.forEach(unpatch => unpatch());
     patches = [];
 
-    injected.forEach((original, obj) => {
-        try { obj.banner = original; } catch { /* nothing to restore */ }
+    injected.forEach((original, target) => {
+        try { target.banner = original; } catch { /* nothing to restore */ }
     });
     injected.clear();
-    counters.clear();
-    shapesLogged.clear();
-
-    debug("unloaded");
 }

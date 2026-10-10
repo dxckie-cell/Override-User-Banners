@@ -6,6 +6,6 @@
       "name": "dxckie-cell"
     }
   ],
-  "version": "1.4.0",
+  "version": "1.5.0",
   "main": "src/index.ts"
 }
