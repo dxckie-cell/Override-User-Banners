@@ -1,9 +1,9 @@
 import { findAll, findByStoreName } from "@vendetta/metro";
 import { FluxDispatcher } from "@vendetta/metro/common";
 import { storage } from "@vendetta/plugin";
+import { showToast } from "@vendetta/ui/toasts";
 
-// tag added to all print statements to help with debugging with logcat on adb
-const TAG = "[custom-banners]";
+import { debug } from "./debug";
 
 // placeholder banner hash, only used so the profile UI renders a banner area
 // for users who have no banner of their own; the URL getter swaps it out
@@ -58,14 +58,14 @@ function withBanner(profile: any, userId?: string) {
     return { ...profile, banner: PLACEHOLDER_HASH };
 }
 
-export function onLoad(): void {
-    console.log(`${TAG} loaded`);
+function applyPatches(): void {
+    debug("loaded v1.1.1");
 
     initStorage();
 
     const UserStore = findByStoreName("UserStore");
     if (!UserStore) {
-        console.log(`${TAG} userStore not found`);
+        debug("userStore not found");
         return;
     }
 
@@ -73,7 +73,7 @@ export function onLoad(): void {
 
     // patch every banner getter we can find, since the name differs between builds.
     // anything like getUserBannerURL / getUserBannerSource is wrapped, and every
-    // banner-looking export is logged so a missing one can be spotted in logcat
+    // banner-looking export is listed so a missing one can be spotted
     let modules: any[] = [];
     try {
         modules = findAll((m: any) => {
@@ -84,9 +84,9 @@ export function onLoad(): void {
             }
         }) as any[];
     } catch (e) {
-        console.log(`${TAG} module scan failed:`, (e as Error)?.message);
+        debug(`module scan failed: ${(e as Error)?.message}`);
     }
-    console.log(`${TAG} found ${modules.length} modules with banner exports`);
+    debug(`found ${modules.length} modules with banner exports`);
 
     const done = new Set<any>();
     for (const mod of modules) {
@@ -95,11 +95,13 @@ export function onLoad(): void {
 
         for (const key of Object.keys(mod)) {
             if (!BANNER_KEY.test(key) || typeof mod[key] !== "function") continue;
-            console.log(`${TAG} banner export: ${key}`);
 
             // only getters that return a URL or an image source; hooks and
             // components are left alone
-            if (!/^get.*(url|source|uri|image)$/i.test(key)) continue;
+            if (!/^get.*(url|source|uri|image)$/i.test(key)) {
+                debug(`export (not patched): ${key}`);
+                continue;
+            }
 
             const wantsSource = /source$/i.test(key);
             const ok = wrap(mod, key, (original, self, args) => {
@@ -116,7 +118,7 @@ export function onLoad(): void {
             });
             if (ok) {
                 patched++;
-                console.log(`${TAG} patched ${key}`);
+                debug(`patched ${key}`);
             }
         }
     }
@@ -127,23 +129,24 @@ export function onLoad(): void {
         const ok = wrap(UserProfileStore, "getUserProfile", (original, self, args) =>
             withBanner(original.apply(self, args), args[0])
         );
-        if (ok) patched++;
+        if (ok) {
+            patched++;
+            debug("patched UserProfileStore.getUserProfile");
+        }
 
         // per-server profile, args are (userId, guildId)
         const ok2 = wrap(UserProfileStore, "getGuildMemberProfile", (original, self, args) =>
             withBanner(original.apply(self, args), args[0])
         );
-        if (ok2) patched++;
+        if (ok2) {
+            patched++;
+            debug("patched UserProfileStore.getGuildMemberProfile");
+        }
     } else {
-        console.log(`${TAG} userProfileStore not found`);
+        debug("userProfileStore not found");
     }
 
-    if (patched === 0) {
-        console.log(`${TAG} nothing could be patched`);
-        return;
-    }
-
-    console.log(`${TAG} ${patched} patches applied`);
+    debug(patched === 0 ? "nothing could be patched" : `${patched} patches applied`);
 
     // refresh ui for every overridden user
     for (const entry of (storage.overrides ?? []) as BannerOverride[]) {
@@ -153,18 +156,32 @@ export function onLoad(): void {
                 FluxDispatcher.dispatch({ type: "USER_UPDATE", user });
             }
         } catch (e) {
-            console.log(`${TAG} could not trigger refresh for ${entry?.id}:`, (e as Error)?.message);
+            debug(`could not trigger refresh for ${entry?.id}: ${(e as Error)?.message}`);
         }
     }
-    console.log(`${TAG} ui refreshed`);
+
+    try {
+        showToast(`Override User Banners: ${patched} patches`);
+    } catch {
+        // toast is only a convenience
+    }
+}
+
+export function onLoad(): void {
+    // an exception here would stop the plugin silently, so keep it visible
+    try {
+        applyPatches();
+    } catch (e) {
+        debug(`onLoad crashed: ${(e as Error)?.message}`);
+    }
 }
 
 export function onUnload(): void {
-    console.log(`${TAG} unloading...`);
+    debug("unloading...");
 
     // restore patches
     patches.forEach(unpatch => unpatch());
     patches = [];
 
-    console.log(`${TAG} unloaded`);
+    debug("unloaded");
 }
