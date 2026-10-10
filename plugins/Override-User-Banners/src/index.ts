@@ -3,7 +3,9 @@ import { FluxDispatcher } from "@vendetta/metro/common";
 import { storage } from "@vendetta/plugin";
 import { showToast } from "@vendetta/ui/toasts";
 
-import { debug } from "./debug";
+import { debug, debugSlot, resetDebug, shape } from "./debug";
+
+const VERSION = "1.3.0";
 
 // placeholder banner hash, only used so the profile UI renders a banner area
 // for users who have no banner of their own; the URL getter swaps it out
@@ -13,17 +15,19 @@ const BANNER_KEY = /banner/i;
 
 let patches: (() => void)[] = [];
 
-// users we put a placeholder banner on, with what it was before
-const injectedUsers = new Map<any, any>();
+// users and profiles we put a placeholder banner on, with what it was before
+const injected = new Map<any, any>();
 
-// log a message the first time a given tag shows up, so the debug list
-// shows what happens at runtime without being flooded
-const traced = new Set<string>();
-function traceOnce(tag: string, message: string): void {
-    if (traced.has(tag)) return;
-    traced.add(tag);
-    debug(message);
+// how often each patched function ran, for the debug list
+const counters = new Map<string, number>();
+function bump(tag: string): number {
+    const n = (counters.get(tag) ?? 0) + 1;
+    counters.set(tag, n);
+    return n;
 }
+
+// which functions have already had the shape of their first argument logged
+const shapesLogged = new Set<string>();
 
 export { default as settings } from "./settings";
 
@@ -53,25 +57,55 @@ function getOverrideUrl(userId?: string): string | undefined {
 // wraps obj[key] so that `wrapper(original, ...args)` runs instead, and
 // registers a function that puts the original back on unload
 function wrap(obj: any, key: string, wrapper: (original: Function, self: any, args: any[]) => any): boolean {
-    const original = obj?.[key];
-    if (typeof original !== "function") return false;
+    try {
+        const original = obj?.[key];
+        if (typeof original !== "function") return false;
 
-    obj[key] = function (...args: any[]) {
-        return wrapper(original, this, args);
-    };
-    patches.push(() => { obj[key] = original; });
-    return true;
+        obj[key] = function (...args: any[]) {
+            return wrapper(original, this, args);
+        };
+        patches.push(() => { obj[key] = original; });
+        return true;
+    } catch (e) {
+        debug(`could not patch ${key}: ${(e as Error)?.message}`);
+        return false;
+    }
 }
 
-// gives profiles of overridden users a banner so the UI shows the banner area
+// gives a profile of an overridden user a banner so the UI shows the banner
+// area. the object is changed in place (and restored on unload) so that any
+// methods on it keep working; a copy is only used if it can't be changed
 function withBanner(profile: any, userId?: string) {
     if (!profile || !getOverrideUrl(userId)) return profile;
     if (profile.banner) return profile;
-    return { ...profile, banner: PLACEHOLDER_HASH };
+    try {
+        injected.set(profile, profile.banner);
+        profile.banner = PLACEHOLDER_HASH;
+        return profile;
+    } catch {
+        return { ...profile, banner: PLACEHOLDER_HASH };
+    }
+}
+
+function profileWrapper(name: string) {
+    return (original: Function, self: any, args: any[]) => {
+        const profile = original.apply(self, args);
+        if (getOverrideUrl(args[0])) {
+            const kind = profile ? "found" : "null";
+            const n = bump(`${name}:${kind}`);
+            debugSlot(
+                `${name}:${kind}`,
+                `${name} for an overridden user: ${kind} x${n}` +
+                (profile ? `, banner=${String(profile.banner)}, type=${profile.constructor?.name}` : "")
+            );
+        }
+        return withBanner(profile, args[0]);
+    };
 }
 
 function applyPatches(): void {
-    debug("loaded v1.2.0");
+    resetDebug();
+    debug(`loaded v${VERSION}`);
 
     initStorage();
 
@@ -87,7 +121,11 @@ function applyPatches(): void {
             const id = entry?.id?.trim();
             if (!id) continue;
             const u = UserStore.getUser(id);
-            debug(`override user ${id}: ${u ? `in cache, banner=${String(u.banner)}, getBannerURL=${typeof u.getBannerURL}` : "not in cache"}`);
+            // a placeholder left behind by an earlier load that was not unloaded
+            if (u && u.banner === PLACEHOLDER_HASH) {
+                try { u.banner = null; } catch { /* leave it */ }
+            }
+            debug(`override user ${id}: ${u ? `in cache, banner=${String(u.banner)}` : "not in cache"}`);
         } catch (e) {
             debug(`could not inspect ${entry?.id}: ${(e as Error)?.message}`);
         }
@@ -96,8 +134,9 @@ function applyPatches(): void {
     let patched = 0;
 
     // patch every banner getter we can find, since the name differs between builds.
-    // anything like getUserBannerURL / getUserBannerSource is wrapped, and every
-    // banner-looking export is listed so a missing one can be spotted
+    // anything like getUserBannerURL / getUserBannerSource is wrapped, and the
+    // profile-related ones that aren't getters are traced so we can see how
+    // the profile screen calls them
     let modules: any[] = [];
     try {
         modules = findAll((m: any) => {
@@ -120,55 +159,68 @@ function applyPatches(): void {
         for (const key of Object.keys(mod)) {
             if (!BANNER_KEY.test(key) || typeof mod[key] !== "function") continue;
 
-            // only getters that return a URL or an image source; hooks and
-            // components are left alone
-            if (!/^get.*(url|source|uri|image)$/i.test(key)) {
-                // only list the ones that could plausibly be about profiles
-                if (/user|profile|member/i.test(key)) debug(`export (not patched): ${key}`);
+            const isGetter = /^get.*(url|source|uri|image)$/i.test(key);
+            const isProfileRelated = /user|profile|member/i.test(key);
+
+            // hooks about profiles are only traced, never changed
+            if (!isGetter) {
+                if (/^use/.test(key) && isProfileRelated) {
+                    const slot = `hook:${key}`;
+                    debugSlot(slot, `${key} (traced): 0 calls`);
+                    wrap(mod, key, (original, self, args) => {
+                        const n = bump(slot);
+                        if (!shapesLogged.has(slot)) {
+                            shapesLogged.add(slot);
+                            debug(`${key} first args: ${args.map(shape).join(" | ")}`);
+                        }
+                        debugSlot(slot, `${key} (traced): ${n} calls`);
+                        return original.apply(self, args);
+                    });
+                } else if (isProfileRelated) {
+                    debug(`export (not patched): ${key}`);
+                }
                 continue;
             }
 
             const wantsSource = /source$/i.test(key);
+            const slot = `get:${key}`;
+            debugSlot(slot, `patched ${key}: 0 calls, 0 for overridden users`);
+
             const ok = wrap(mod, key, (original, self, args) => {
                 const first = args[0];
                 const id = typeof first === "string" ? first : first?.id;
                 const overrideUrl = getOverrideUrl(id);
                 const result = original.apply(self, args);
+
+                const all = bump(`${slot}:all`);
+                const mine = overrideUrl ? bump(`${slot}:mine`) : (counters.get(`${slot}:mine`) ?? 0);
+                if (!shapesLogged.has(slot) && isProfileRelated) {
+                    shapesLogged.add(slot);
+                    debug(`${key} first arg: ${shape(first)}`);
+                }
+                debugSlot(slot, `patched ${key}: ${all} calls, ${mine} for overridden users`);
+
                 // only intercept users that have an override, ignore everyone else
                 if (!overrideUrl) return result;
-                traceOnce(`get:${key}`, `${key} was called for an overridden user`);
                 if (wantsSource) {
                     return { ...(result && typeof result === "object" ? result : {}), uri: overrideUrl };
                 }
                 return overrideUrl;
             });
-            if (ok) {
-                patched++;
-                debug(`patched ${key}`);
-            }
+            if (ok) patched++;
         }
     }
 
-    // patch the profile store, so users without a banner still get one rendered
+    // patch the profile stores, so users without a banner still get one rendered
     const UserProfileStore = findByStoreName("UserProfileStore");
     if (UserProfileStore) {
-        const ok = wrap(UserProfileStore, "getUserProfile", (original, self, args) => {
-            const profile = original.apply(self, args);
-            if (getOverrideUrl(args[0])) {
-                traceOnce("profile", `getUserProfile for an overridden user: ${profile ? `found, banner=${String(profile.banner)}` : "null"}`);
-            }
-            return withBanner(profile, args[0]);
-        });
-        if (ok) {
+        if (wrap(UserProfileStore, "getUserProfile", profileWrapper("getUserProfile"))) {
             patched++;
             debug("patched UserProfileStore.getUserProfile");
         }
 
         // per-server profile, args are (userId, guildId)
-        const ok2 = wrap(UserProfileStore, "getGuildMemberProfile", (original, self, args) =>
-            withBanner(original.apply(self, args), args[0])
-        );
-        if (ok2) {
+        if (wrap(UserProfileStore, "getGuildMemberProfile", profileWrapper("getGuildMemberProfile"))) {
             patched++;
             debug("patched UserProfileStore.getGuildMemberProfile");
         }
@@ -182,11 +234,12 @@ function applyPatches(): void {
         const user = original.apply(self, args);
         if (user && !user.banner && getOverrideUrl(args[0])) {
             try {
-                injectedUsers.set(user, user.banner);
+                injected.set(user, user.banner);
                 user.banner = PLACEHOLDER_HASH;
-                traceOnce("user", "gave an overridden user a placeholder banner");
+                const n = bump("user-inject");
+                debugSlot("user-inject", `gave an overridden user a placeholder banner x${n}`);
             } catch (e) {
-                traceOnce("user-fail", `could not set banner on user: ${(e as Error)?.message}`);
+                debugSlot("user-inject", `could not set banner on user: ${(e as Error)?.message}`);
             }
         }
         return user;
@@ -227,17 +280,16 @@ export function onLoad(): void {
 }
 
 export function onUnload(): void {
-    debug("unloading...");
-
     // restore patches
     patches.forEach(unpatch => unpatch());
     patches = [];
 
-    injectedUsers.forEach((original, user) => {
-        try { user.banner = original; } catch { /* nothing to restore */ }
+    injected.forEach((original, obj) => {
+        try { obj.banner = original; } catch { /* nothing to restore */ }
     });
-    injectedUsers.clear();
-    traced.clear();
+    injected.clear();
+    counters.clear();
+    shapesLogged.clear();
 
     debug("unloaded");
 }
