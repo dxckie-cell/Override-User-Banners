@@ -5,7 +5,7 @@ import { showToast } from "@vendetta/ui/toasts";
 
 import { debug, debugSlot, resetDebug, shape } from "./debug";
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 
 // placeholder banner hash, only used so the profile UI renders a banner area
 // for users who have no banner of their own; the URL getter swaps it out
@@ -26,8 +26,11 @@ function bump(tag: string): number {
     return n;
 }
 
-// which functions have already had the shape of their first argument logged
+// which things have already had their shape logged
 const shapesLogged = new Set<string>();
+
+// display profiles (the object the profile screen reads) already handled
+const seenProfiles = new WeakSet<object>();
 
 export { default as settings } from "./settings";
 
@@ -103,6 +106,164 @@ function profileWrapper(name: string) {
     };
 }
 
+// --- display profile -------------------------------------------------------
+// the profile screen passes a "displayProfile" object around instead of
+// calling the URL getters, so its banner fields are changed directly
+
+// every banner-looking property name on an object and its prototype chain
+function bannerNames(obj: any): string[] {
+    const names = new Set<string>();
+    let current = obj;
+    for (let depth = 0; current && current !== Object.prototype && depth < 6; depth++) {
+        try {
+            for (const name of Object.getOwnPropertyNames(current)) {
+                if (BANNER_KEY.test(name)) names.add(name);
+            }
+        } catch {
+            // skip objects that can't be inspected
+        }
+        current = Object.getPrototypeOf(current);
+    }
+    return Array.from(names);
+}
+
+function setOwn(obj: any, name: string, value: any): boolean {
+    try {
+        Object.defineProperty(obj, name, { value, configurable: true, writable: true, enumerable: true });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+// what to put in place of the banner property `name`, or undefined to leave it
+function replacementFor(name: string, isFn: boolean, current: any, url: string): { value: any } | undefined {
+    if (name.toLowerCase() === "banner") {
+        return current ? undefined : { value: PLACEHOLDER_HASH };
+    }
+    if (/source$/i.test(name)) {
+        return { value: isFn ? () => ({ uri: url }) : { uri: url } };
+    }
+    if (/(url|uri)$/i.test(name)) {
+        return { value: isFn ? () => url : url };
+    }
+    if (/^has.*banner/i.test(name)) {
+        return { value: isFn ? () => true : true };
+    }
+    return undefined;
+}
+
+function handleDisplayProfile(dp: any, userId?: string): void {
+    if (!dp || typeof dp !== "object" || seenProfiles.has(dp)) return;
+    seenProfiles.add(dp);
+
+    const names = bannerNames(dp);
+    const url = getOverrideUrl(userId ?? dp.userId ?? dp.id);
+
+    const slot = url ? "dp-mine" : "dp-other";
+    if (!shapesLogged.has(slot)) {
+        shapesLogged.add(slot);
+        let keys = "?";
+        try { keys = Object.keys(dp).slice(0, 24).join(","); } catch { /* ignore */ }
+        debug(
+            `${url ? "overridden" : "another"} user's displayProfile: type=${dp.constructor?.name}, ` +
+            `banner=${String(dp.banner)}, banner names=[${names.join(",")}], keys=[${keys}]`
+        );
+    }
+
+    if (!url) return;
+
+    const changed: string[] = [];
+    for (const name of names) {
+        let isFn = false;
+        let current: any;
+        try {
+            current = dp[name];
+            isFn = typeof current === "function";
+        } catch {
+            continue;
+        }
+        const replacement = replacementFor(name, isFn, isFn ? undefined : current, url);
+        if (replacement && setOwn(dp, name, replacement.value)) changed.push(name);
+    }
+
+    const n = bump("dp-changed");
+    debugSlot("dp-changed", `changed ${n} displayProfiles of overridden users, last: [${changed.join(",")}]`);
+}
+
+// --- per-export patches ----------------------------------------------------
+// these are separate functions on purpose: closures made inside a loop shared
+// their variables in the built bundle, so every value is passed in instead
+
+function getterWrapper(key: string, isProfileRelated: boolean) {
+    const slot = `get:${key}`;
+    const wantsSource = /source$/i.test(key);
+
+    return (original: Function, self: any, args: any[]) => {
+        const first = args[0];
+        const id = typeof first === "string" ? first : first?.id;
+        const overrideUrl = getOverrideUrl(id);
+        const result = original.apply(self, args);
+
+        const all = bump(`${slot}:all`);
+        const mine = overrideUrl ? bump(`${slot}:mine`) : (counters.get(`${slot}:mine`) ?? 0);
+        if (isProfileRelated && !shapesLogged.has(slot)) {
+            shapesLogged.add(slot);
+            debug(`${key} first arg: ${shape(first)}`);
+        }
+        debugSlot(slot, `patched ${key}: ${all} calls, ${mine} for overridden users`);
+
+        // only intercept users that have an override, ignore everyone else
+        if (!overrideUrl) return result;
+        if (wantsSource) {
+            return { ...(result && typeof result === "object" ? result : {}), uri: overrideUrl };
+        }
+        return overrideUrl;
+    };
+}
+
+function hookTracer(key: string) {
+    const slot = `hook:${key}`;
+
+    return (original: Function, self: any, args: any[]) => {
+        const n = bump(slot);
+        if (!shapesLogged.has(slot)) {
+            shapesLogged.add(slot);
+            debug(`${key} first args: ${args.map(shape).join(" | ")}`);
+        }
+        debugSlot(slot, `${key} (traced): ${n} calls`);
+
+        for (const arg of args) {
+            if (arg && typeof arg === "object" && arg.displayProfile) {
+                handleDisplayProfile(arg.displayProfile, arg.user?.id);
+            }
+        }
+        return original.apply(self, args);
+    };
+}
+
+// patches or traces one export of a module, returns true if it was changed
+function patchExport(mod: any, key: string): boolean {
+    if (!BANNER_KEY.test(key) || typeof mod[key] !== "function") return false;
+
+    const isGetter = /^get.*(url|source|uri|image)$/i.test(key);
+    const isProfileRelated = /profile|member|^useUser/i.test(key);
+
+    if (isGetter) {
+        debugSlot(`get:${key}`, `patched ${key}: 0 calls, 0 for overridden users`);
+        return wrap(mod, key, getterWrapper(key, isProfileRelated));
+    }
+
+    // hooks about profiles are only traced, never changed
+    if (/^use/.test(key) && isProfileRelated) {
+        debugSlot(`hook:${key}`, `${key} (traced): 0 calls`);
+        wrap(mod, key, hookTracer(key));
+    } else if (isProfileRelated) {
+        debug(`export (not patched): ${key}`);
+    }
+    return false;
+}
+
 function applyPatches(): void {
     resetDebug();
     debug(`loaded v${VERSION}`);
@@ -133,10 +294,7 @@ function applyPatches(): void {
 
     let patched = 0;
 
-    // patch every banner getter we can find, since the name differs between builds.
-    // anything like getUserBannerURL / getUserBannerSource is wrapped, and the
-    // profile-related ones that aren't getters are traced so we can see how
-    // the profile screen calls them
+    // patch every banner getter we can find, since the name differs between builds
     let modules: any[] = [];
     try {
         modules = findAll((m: any) => {
@@ -157,57 +315,7 @@ function applyPatches(): void {
         done.add(mod);
 
         for (const key of Object.keys(mod)) {
-            if (!BANNER_KEY.test(key) || typeof mod[key] !== "function") continue;
-
-            const isGetter = /^get.*(url|source|uri|image)$/i.test(key);
-            const isProfileRelated = /user|profile|member/i.test(key);
-
-            // hooks about profiles are only traced, never changed
-            if (!isGetter) {
-                if (/^use/.test(key) && isProfileRelated) {
-                    const slot = `hook:${key}`;
-                    debugSlot(slot, `${key} (traced): 0 calls`);
-                    wrap(mod, key, (original, self, args) => {
-                        const n = bump(slot);
-                        if (!shapesLogged.has(slot)) {
-                            shapesLogged.add(slot);
-                            debug(`${key} first args: ${args.map(shape).join(" | ")}`);
-                        }
-                        debugSlot(slot, `${key} (traced): ${n} calls`);
-                        return original.apply(self, args);
-                    });
-                } else if (isProfileRelated) {
-                    debug(`export (not patched): ${key}`);
-                }
-                continue;
-            }
-
-            const wantsSource = /source$/i.test(key);
-            const slot = `get:${key}`;
-            debugSlot(slot, `patched ${key}: 0 calls, 0 for overridden users`);
-
-            const ok = wrap(mod, key, (original, self, args) => {
-                const first = args[0];
-                const id = typeof first === "string" ? first : first?.id;
-                const overrideUrl = getOverrideUrl(id);
-                const result = original.apply(self, args);
-
-                const all = bump(`${slot}:all`);
-                const mine = overrideUrl ? bump(`${slot}:mine`) : (counters.get(`${slot}:mine`) ?? 0);
-                if (!shapesLogged.has(slot) && isProfileRelated) {
-                    shapesLogged.add(slot);
-                    debug(`${key} first arg: ${shape(first)}`);
-                }
-                debugSlot(slot, `patched ${key}: ${all} calls, ${mine} for overridden users`);
-
-                // only intercept users that have an override, ignore everyone else
-                if (!overrideUrl) return result;
-                if (wantsSource) {
-                    return { ...(result && typeof result === "object" ? result : {}), uri: overrideUrl };
-                }
-                return overrideUrl;
-            });
-            if (ok) patched++;
+            if (patchExport(mod, key)) patched++;
         }
     }
 
