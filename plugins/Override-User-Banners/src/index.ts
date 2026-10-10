@@ -1,4 +1,4 @@
-import { findByProps, findByStoreName } from "@vendetta/metro";
+import { findAll, findByStoreName } from "@vendetta/metro";
 import { FluxDispatcher } from "@vendetta/metro/common";
 import { storage } from "@vendetta/plugin";
 
@@ -8,6 +8,8 @@ const TAG = "[custom-banners]";
 // placeholder banner hash, only used so the profile UI renders a banner area
 // for users who have no banner of their own; the URL getter swaps it out
 const PLACEHOLDER_HASH = "override-user-banner";
+
+const BANNER_KEY = /banner/i;
 
 let patches: (() => void)[] = [];
 
@@ -69,30 +71,54 @@ export function onLoad(): void {
 
     let patched = 0;
 
-    // patch the banner URL getter, overrides the banner wherever a URL is built
-    const bannerModule = findByProps("getUserBannerURL");
-    if (bannerModule) {
-        const ok = wrap(bannerModule, "getUserBannerURL", (original, self, args) => {
-            const overrideUrl = getOverrideUrl(args[0]?.id);
-            // only intercept users that have an override
-            if (overrideUrl) return overrideUrl;
-            // ignore everyone else
-            return original.apply(self, args);
-        });
-        if (ok) patched++;
-
-        // some builds expose an image source object instead of a plain URL
-        const ok2 = wrap(bannerModule, "getUserBannerSource", (original, self, args) => {
-            const overrideUrl = getOverrideUrl(args[0]?.id);
-            const result = original.apply(self, args);
-            if (overrideUrl) {
-                return { ...(result ?? {}), uri: overrideUrl };
+    // patch every banner getter we can find, since the name differs between builds.
+    // anything like getUserBannerURL / getUserBannerSource is wrapped, and every
+    // banner-looking export is logged so a missing one can be spotted in logcat
+    let modules: any[] = [];
+    try {
+        modules = findAll((m: any) => {
+            try {
+                return !!m && Object.keys(m).some(k => BANNER_KEY.test(k) && typeof m[k] === "function");
+            } catch {
+                return false;
             }
-            return result;
-        });
-        if (ok2) patched++;
-    } else {
-        console.log(`${TAG} banner module not found`);
+        }) as any[];
+    } catch (e) {
+        console.log(`${TAG} module scan failed:`, (e as Error)?.message);
+    }
+    console.log(`${TAG} found ${modules.length} modules with banner exports`);
+
+    const done = new Set<any>();
+    for (const mod of modules) {
+        if (done.has(mod)) continue;
+        done.add(mod);
+
+        for (const key of Object.keys(mod)) {
+            if (!BANNER_KEY.test(key) || typeof mod[key] !== "function") continue;
+            console.log(`${TAG} banner export: ${key}`);
+
+            // only getters that return a URL or an image source; hooks and
+            // components are left alone
+            if (!/^get.*(url|source|uri|image)$/i.test(key)) continue;
+
+            const wantsSource = /source$/i.test(key);
+            const ok = wrap(mod, key, (original, self, args) => {
+                const first = args[0];
+                const id = typeof first === "string" ? first : first?.id;
+                const overrideUrl = getOverrideUrl(id);
+                const result = original.apply(self, args);
+                // only intercept users that have an override, ignore everyone else
+                if (!overrideUrl) return result;
+                if (wantsSource) {
+                    return { ...(result && typeof result === "object" ? result : {}), uri: overrideUrl };
+                }
+                return overrideUrl;
+            });
+            if (ok) {
+                patched++;
+                console.log(`${TAG} patched ${key}`);
+            }
+        }
     }
 
     // patch the profile store, so users without a banner still get one rendered
