@@ -1,0 +1,11 @@
+{
+  "name": "Override User Banners",
+  "description": "Allows you to set a custom profile banner for any Discord user.",
+  "authors": [
+    {
+      "name": "dxckie-cell"
+    }
+  ],
+  "version": "1.0.0",
+  "main": "src/index.ts"
+}
